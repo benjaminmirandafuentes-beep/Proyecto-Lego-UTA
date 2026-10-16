@@ -1,21 +1,4 @@
 """
-control_remoto.py - Mando para controlar el cañón lanzador (SPIKE Prime + Pybricks)
-====================================================================================
-Cómo usarlo (con robot_hub.py en la MISMA carpeta):
-
-    python control_remoto.py            -> conecta con el hub y abre el mando
-    python control_remoto.py --buscar   -> lista los hubs Pybricks cercanos (nombre y señal)
-    python control_remoto.py --demo     -> abre el mando SIN robot, con datos simulados
-
-Antes de conectar:
-  * Hub encendido, con la luz del botón central parpadeando en azul.
-  * code.pybricks.com cerrado (solo un programa puede usar el Bluetooth del hub).
-
-Arquitectura (cliente - servidor):
-  PC (cliente)  --Bluetooth-->  hub (servidor): recibe órdenes y mueve motores
-  PC (cliente)  <--Bluetooth--  hub (servidor): informa distancia y reflexión de color
-  El seguidor de línea se calcula DENTRO del hub (rápido, sin depender del Bluetooth).
-
 Controles de teclado: W A S D o flechas = mover (mantener presionado), Espacio = disparar.
 """
 
@@ -28,13 +11,8 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-# ----------------------------------------------------------------------
-# Configuración
-# ----------------------------------------------------------------------
-# En el laboratorio hay varios robots: con None se conecta al PRIMER hub que
-# encuentre, que podría ser el de otro grupo. Corre "--buscar" y pon aquí el
-# nombre de TU hub, por ejemplo NOMBRE_HUB = "Pybricks Hub".
-NOMBRE_HUB = None
+
+NOMBRE_HUB = "fldsmdfr"
 
 RUTA_PROGRAMA_HUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "robot_hub.py")
 
@@ -43,7 +21,6 @@ DIST_MAX_CM = 200       # fondo de la barra de distancia
 DIST_ALERTA_CM = 20     # por debajo de esto el indicador se pone rojo
 SIN_OBJETO_MM = 2000    # el sensor devuelve 2000 mm cuando no detecta nada
 
-# Apariencia (sencilla; el diseño final se puede cambiar después)
 FUENTE = "Segoe UI"
 BG = "#EDEFF0"
 TEXTO = "#1F2D33"
@@ -86,7 +63,6 @@ class ConexionHub:
         asyncio.run(self._principal())
 
     def _al_recibir(self, datos):
-        """Llega texto del hub; se junta y se corta por líneas."""
         self._buffer += bytes(datos)
         while b"\n" in self._buffer:
             linea, self._buffer = self._buffer.split(b"\n", 1)
