@@ -1,25 +1,39 @@
 """
+Antes de conectar:
+  * Hub encendido, con la luz del botón central parpadeando en azul.
+  * code.pybricks.com cerrado (solo un programa puede usar el Bluetooth del hub).
+
+Arquitectura (cliente - servidor):
+  PC (cliente)  --Bluetooth-->  hub (servidor): recibe órdenes y mueve motores
+  PC (cliente)  <--Bluetooth--  hub (servidor): informa distancia y reflexión de color
+ 
+
 Controles de teclado: W A S D o flechas = mover (mantener presionado), Espacio = disparar.
 """
-
 import asyncio
 import os
 import queue
 import random
+import statistics
 import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
+
+from balistica import ModeloDisparo, NOMBRES
 
 
 NOMBRE_HUB = "fldsmdfr"
 
 RUTA_PROGRAMA_HUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "robot_hub.py")
 
-VEL_DISPARO_MAX = 900   # debe coincidir con robot_hub.py
-DIST_MAX_CM = 200       # fondo de la barra de distancia
-DIST_ALERTA_CM = 20     # por debajo de esto el indicador se pone rojo
-SIN_OBJETO_MM = 2000    # el sensor devuelve 2000 mm cuando no detecta nada
+VEL_DISPARO_MAX = 900   
+DIST_MAX_CM = 200       
+DIST_ALERTA_CM = 20     
+SIN_OBJETO_MM = 2000 
+
+
+# DISEÑO
 
 FUENTE = "Segoe UI"
 BG = "#EDEFF0"
@@ -35,9 +49,8 @@ MORADO = "#6A4C93"
 MORADO_OSC = "#523775"
 
 
-# ======================================================================
-# Conexiones (la ventana solo usa enviar / cerrar / iniciar)
-# ======================================================================
+
+
 class ConexionHub:
     """Habla con el hub por Bluetooth usando pybricksdev, en un hilo aparte."""
 
@@ -63,6 +76,7 @@ class ConexionHub:
         asyncio.run(self._principal())
 
     def _al_recibir(self, datos):
+        """Llega texto del hub; se junta y se corta por líneas."""
         self._buffer += bytes(datos)
         while b"\n" in self._buffer:
             linea, self._buffer = self._buffer.split(b"\n", 1)
@@ -193,6 +207,7 @@ class Mando:
 
         self.velocidad = tk.IntVar(value=50)
         self.potencia = tk.IntVar(value=60)
+        self.metodo = tk.StringVar(value="empirico")   # método de puntería elegido
 
         self.listo = False
         self.conexion_viva = True
@@ -205,10 +220,14 @@ class Mando:
         self.reflexion = None
         self.negro = None
         self.blanco = None
+        self.modelo = ModeloDisparo()
+        self.ultima_potencia = None   # potencia del último disparo (para calibrar)
+        self.distancias = []          # últimas lecturas del sensor, en cm
 
         self._construir()
         root.bind("<KeyPress>", self._tecla_abajo)
         root.bind("<KeyRelease>", self._tecla_arriba)
+        root.bind("<Button-1>", self._clic_en_ventana)
         root.protocol("WM_DELETE_WINDOW", self.cerrar)
 
         self.conexion.iniciar()
@@ -273,7 +292,50 @@ class Mando:
         ajustes = tk.Frame(r, bg=BG)
         ajustes.grid(row=4, column=0, columnspan=2, padx=24, pady=(6, 16))
         self._slider(ajustes, "Velocidad de avance", self.velocidad, self._velocidad_cambio)
-        self._slider(ajustes, "Potencia de disparo", self.potencia, None)
+        self.esc_potencia = self._slider(ajustes, "Potencia de disparo", self.potencia, None)
+
+        # Puntería: la potencia que acierta a la distancia que mide el sensor
+        punt = tk.Frame(r, bg=BG)
+        punt.grid(row=5, column=0, columnspan=2, padx=24, pady=(0, 14))
+        tk.Button(punt, text="AUTO-POTENCIA (según la distancia)", width=34,
+                  font=(FUENTE, 10, "bold"), bg=AZUL, fg="white", activebackground=AZUL_OSC,
+                  activeforeground="white", relief="flat", pady=5, takefocus=0,
+                  command=self.auto_potencia).pack(fill="x")
+        fm = tk.Frame(punt, bg=BG)
+        fm.pack(pady=(8, 0))
+        tk.Label(fm, text="Método:", bg=BG, fg=TEXTO, font=(FUENTE, 9)).pack(side="left")
+        for valor, texto in (("empirico", "Empírico (datos)"), ("fisico", "Físico (parabólico)")):
+            tk.Radiobutton(fm, text=texto, value=valor, variable=self.metodo, bg=BG, fg=TEXTO,
+                           activebackground=BG, font=(FUENTE, 9), takefocus=0,
+                           command=self._cambio_metodo).pack(side="left", padx=4)
+        ff = tk.Frame(punt, bg=BG)
+        ff.pack(pady=(4, 0))
+        tk.Label(ff, text="Ángulo del cañón", bg=BG, fg=TEXTO, font=(FUENTE, 9)).pack(side="left")
+        self.entrada_angulo = tk.Entry(ff, width=5, justify="center")
+        self.entrada_angulo.insert(0, f"{self.modelo.angulo_deg:g}")
+        self.entrada_angulo.pack(side="left", padx=4)
+        tk.Label(ff, text="°    Altura de salida", bg=BG, fg=TEXTO,
+                 font=(FUENTE, 9)).pack(side="left")
+        self.entrada_altura = tk.Entry(ff, width=5, justify="center")
+        self.entrada_altura.insert(0, f"{self.modelo.altura_cm:g}")
+        self.entrada_altura.pack(side="left", padx=4)
+        tk.Label(ff, text="cm", bg=BG, fg=TEXTO, font=(FUENTE, 9)).pack(side="left")
+        for caja in (self.entrada_angulo, self.entrada_altura):
+            caja.bind("<Return>", lambda e: self._cambio_metodo())
+        fila2 = tk.Frame(punt, bg=BG)
+        fila2.pack(pady=(8, 0))
+        tk.Label(fila2, text="El último disparo cayó a", bg=BG, fg=TEXTO,
+                 font=(FUENTE, 9)).pack(side="left")
+        self.entrada_alcance = tk.Entry(fila2, width=6, justify="center")
+        self.entrada_alcance.pack(side="left", padx=4)
+        self.entrada_alcance.bind("<Return>", lambda e: self.guardar_disparo())
+        tk.Label(fila2, text="cm", bg=BG, fg=TEXTO, font=(FUENTE, 9)).pack(side="left")
+        tk.Button(fila2, text="Guardar", font=(FUENTE, 9), bg="#CBD2D4", fg=TEXTO,
+                  activebackground="#B5BEC1", relief="flat", padx=10, takefocus=0,
+                  command=self.guardar_disparo).pack(side="left", padx=(8, 0))
+        self.lbl_modelo = tk.Label(punt, text=self.modelo.resumen(), bg=BG, fg=GRIS,
+                                   font=(FUENTE, 9), wraplength=340, justify="center")
+        self.lbl_modelo.pack(pady=(6, 0))
 
     def _boton_mov(self, padre, texto, cmd, fila, col):
         b = tk.Button(padre, text=texto, width=3, height=1, font=(FUENTE, 16), bg=AZUL, fg="white",
@@ -298,6 +360,7 @@ class Mando:
         escala.pack()
         # Al soltar el slider, el foco vuelve a la ventana para que las flechas muevan el robot
         escala.bind("<ButtonRelease-1>", lambda e: self.root.focus_set())
+        return escala
 
     # -- acciones -------------------------------------------------------
     def mover(self, cmd):
@@ -323,6 +386,69 @@ class Mando:
         else:
             self.mover("LIN")
 
+    def auto_potencia(self):
+        """Lee la distancia al objetivo y ajusta el slider con la potencia calculada."""
+        if not self.distancias:
+            self._aviso_modelo("No hay objeto a la vista: apunta el sensor al objetivo.", ROJO)
+            return
+        if not self._aplicar_fisica():
+            return
+        objetivo = statistics.median(self.distancias)   # la mediana evita lecturas sueltas raras
+        metodo = self.metodo.get()
+        potencia, aviso = self.modelo.potencia_para(objetivo, metodo)
+        if potencia is None:
+            self._aviso_modelo(aviso, ROJO)
+            return
+        self.esc_potencia.set(potencia)
+        texto = f"[{NOMBRES[metodo]}] Objetivo a {objetivo:.0f} cm -> potencia {potencia} %"
+        if aviso:
+            texto += "\n" + aviso
+        self._aviso_modelo(texto, NARANJA_OSC if aviso else VERDE)
+
+    def guardar_disparo(self):
+        """Registra dónde cayó el último disparo para que el modelo aprenda."""
+        if self.ultima_potencia is None:
+            self._aviso_modelo("Primero haz un disparo y mide dónde cayó la pelota.", ROJO)
+            return
+        if not self._aplicar_fisica():
+            return
+        try:
+            alcance = float(self.entrada_alcance.get().replace(",", "."))
+            self.modelo.agregar(self.ultima_potencia, alcance)
+        except ValueError:
+            self._aviso_modelo("Escribe la distancia (en cm, mayor que 0) donde cayó la pelota.", ROJO)
+            return
+        guardado = f"Guardado: {self.ultima_potencia} % -> {alcance:.0f} cm."
+        self.ultima_potencia = None          # evita guardar dos veces el mismo disparo
+        self.entrada_alcance.delete(0, "end")
+        self.root.focus_set()
+        self._aviso_modelo(guardado + "\n" + self.modelo.resumen(), VERDE)
+
+    def _aplicar_fisica(self):
+        """Lee el ángulo y la altura de las cajas y se los pasa al modelo. False si no son válidos."""
+        try:
+            angulo = float(self.entrada_angulo.get().replace(",", "."))
+            altura = float(self.entrada_altura.get().replace(",", "."))
+            self.modelo.configurar_fisica(angulo, altura)
+        except ValueError as e:
+            texto = str(e) if "ángulo" in str(e) or "altura" in str(e) else \
+                "Escribe números en el ángulo (0 a 90) y en la altura (cm)."
+            self._aviso_modelo(texto, ROJO)
+            return False
+        return True
+
+    def _cambio_metodo(self):
+        self.root.focus_set()
+        if self._aplicar_fisica():
+            self._aviso_modelo(self.modelo.resumen())
+
+    def _aviso_modelo(self, texto, color=GRIS):
+        self.lbl_modelo.config(text=texto, fg=color)
+
+    def _clic_en_ventana(self, e):
+        if not isinstance(e.widget, tk.Entry):
+            self.root.focus_set()
+
     def calibrar(self, cmd):
         """CAN = guardar el negro, CAB = guardar el blanco (con el sensor sobre ese color)."""
         if self.listo:
@@ -346,6 +472,7 @@ class Mando:
         if not self.listo or self.recargando:
             return
         potencia = self.potencia.get()
+        self.ultima_potencia = potencia
         self.conexion.enviar(b"FUE" + bytes([potencia]))
         self.recargando = True
         self.btn_fuego.config(text="RECARGANDO", state="disabled")
@@ -353,10 +480,14 @@ class Mando:
         self.root.after(espera_ms, self._fin_recarga)
 
     def _fin_recarga(self):
+        if self.cerrando:
+            return      # la ventana se está cerrando
         self.recargando = False
         self.btn_fuego.config(text="DISPARAR", state="normal")
 
     def _tecla_abajo(self, e):
+        if isinstance(self.root.focus_get(), tk.Entry):
+            return      # se está escribiendo un número: no mover el robot
         tecla = e.keysym.lower() if len(e.keysym) == 1 else e.keysym
         if tecla in TECLAS:
             if tecla not in self.teclas_abajo:      # ignora la repetición automática
@@ -366,6 +497,8 @@ class Mando:
             self.disparar()
 
     def _tecla_arriba(self, e):
+        if isinstance(self.root.focus_get(), tk.Entry):
+            return
         tecla = e.keysym.lower() if len(e.keysym) == 1 else e.keysym
         if tecla in self.teclas_abajo:
             self.teclas_abajo.discard(tecla)
@@ -420,10 +553,12 @@ class Mando:
 
     def _mostrar_distancia(self, mm):
         if mm >= SIN_OBJETO_MM:
+            self.distancias = []
             self.lbl_dist.config(text="Sin objeto", fg=GRIS)
             self.barra["value"] = DIST_MAX_CM
             return
         cm = mm / 10
+        self.distancias = (self.distancias + [cm])[-5:]
         self.lbl_dist.config(text=f"{cm:.0f} cm", fg=ROJO if cm < DIST_ALERTA_CM else TEXTO)
         self.barra["value"] = min(cm, DIST_MAX_CM)
 
