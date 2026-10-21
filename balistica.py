@@ -1,38 +1,29 @@
 """
-balistica.py - Potencia de disparo para acertar a una distancia dada
-=====================================================================
-Dos métodos para el mismo problema (el usuario elige cuál usar en el mando):
+El problema pasa a ser de POSICIÓN: el robot debe quedar a una distancia R0 del
+objetivo. Este módulo hace tres cosas:
 
-1) EMPÍRICO (ajuste de datos)
-        alcance = a * potencia ^ b
-   'a' y 'b' se ajustan con los disparos de calibración (mínimos cuadrados en
-   escala logarítmica). No necesita conocer el ángulo ni la altura del cañón.
-
-2) FÍSICO (tiro parabólico, que incluye la caída libre)
-   La pelota sale con velocidad v, ángulo θ y altura h, y cae por la gravedad g:
+ 1) Estima R0 con los disparos de calibración (promedio) y cuánto varía de un
+    disparo a otro (desviación estándar).
+ 2) Compara la distancia que mide el sensor con R0 y dice si hay que acercarse,
+    alejarse o disparar. La zona de acierto es  R0 ± tolerancia, donde
+    tolerancia = max(5 cm, desviación): si los disparos varían mucho, la zona es
+    más ancha porque es lo mejor que se puede garantizar.
 
         y(x) = h + x·tanθ - g·x² / (2·v²·cos²θ)
+        v = sqrt( g·R² / ( 2·cos²θ·(h + R·tanθ) ) )       (velocidad para llegar a R)
 
-   Si debe tocar el piso (y = 0) a la distancia R, la velocidad necesaria es:
+    Casos particulares: con h = 0 queda R = v²·sen(2θ)/g, y con θ = 0 (disparo
+    horizontal) queda la caída libre: R = v·sqrt(2h/g). No incluye la resistencia
+    del aire, que en una pelota de ping pong sí importa: la velocidad estimada es
+    la "efectiva" (ya incluye ese efecto en promedio).
 
-        v = sqrt( g·R² / ( 2·cos²θ·(h + R·tanθ) ) )
+CONVENCIÓN DE MEDIDA (importante): el alcance se mide desde el SENSOR hasta el
+punto donde la pelota toca el piso por PRIMERA vez, en la dirección del disparo.
+Así, la distancia que lee el sensor al apuntar al objetivo se compara directamente
+con el alcance.
 
-   Se supone que la velocidad de salida es proporcional a la potencia:
-
-        v = k · potencia      ->      potencia = v / k
-
-   Con θ y h medidos, la única incógnita es k, que sale de los disparos de
-   calibración. Casos particulares: con h = 0 queda R = v²·sen(2θ)/g, y con
-   θ = 0 (disparo horizontal) queda la caída libre: R = v·sqrt(2h/g).
-   Este modelo NO incluye la resistencia del aire: se nota en su error.
-
-CONVENCIÓN DE MEDIDA (importante): todas las distancias se miden desde el
-SENSOR hasta el punto donde la pelota toca el piso por PRIMERA vez, en la
-dirección del disparo. Así, la distancia que lee el sensor al apuntar al
-objetivo es directamente el alcance que se necesita.
-
-Los disparos de calibración (y el ángulo y la altura) se guardan en
-calibracion_disparos.json, junto a este archivo.
+Si cambias el ángulo del cañón, hay que borrar la calibración y volver a medir.
+Los datos se guardan en calibracion_disparos.json, junto a este archivo.
 """
 
 import json
@@ -40,24 +31,19 @@ import math
 import os
 
 ARCHIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibracion_disparos.json")
-POT_MIN = 10    # mismos límites que el slider del mando
-POT_MAX = 100
-G = 981.0       # gravedad en cm/s²
 
-METODOS = ("empirico", "fisico")
-NOMBRES = {"empirico": "Empírico", "fisico": "Físico"}
+POTENCIA_DISPARO = 30       # % fijo del motor del gatillo
+TOLERANCIA_MIN_CM = 5.0     # el sensor tiene ~1 cm de resolución; menos que esto no tiene sentido
+G = 981.0                   # gravedad en cm/s²
 
 
 class ModeloDisparo:
     def __init__(self, archivo=ARCHIVO):
         self.archivo = archivo      # None = no guardar en disco (útil para pruebas)
-        self.disparos = []          # [(potencia %, alcance cm), ...]
+        self.alcances = []          # alcances medidos (cm), uno por disparo
         self.angulo_deg = 45.0      # ángulo del cañón sobre la horizontal
         self.altura_cm = 20.0       # altura de la boca del cañón sobre el piso
-        self.a = self.b = self.error_empirico_cm = None
-        self.k = self.error_fisico_cm = None
         self._cargar()
-        self._ajustar()
 
     # -- datos ----------------------------------------------------------
     def _cargar(self):
@@ -66,198 +52,140 @@ class ModeloDisparo:
         try:
             with open(self.archivo, encoding="utf-8") as f:
                 datos = json.load(f)
-            if isinstance(datos, list):      # formato anterior: solo la lista de disparos
+            if isinstance(datos, list):          # formato más antiguo: solo una lista
                 datos = {"disparos": datos}
-            self.disparos = [(float(p), float(r)) for p, r in datos.get("disparos", [])]
+            brutos = datos.get("alcances")
+            if brutos is None:                   # formato anterior: pares [potencia, alcance]
+                brutos = [par[1] for par in datos.get("disparos", [])]
+            self.alcances = [float(r) for r in brutos if float(r) > 0]
             self.angulo_deg = float(datos.get("angulo_deg", self.angulo_deg))
             self.altura_cm = float(datos.get("altura_cm", self.altura_cm))
-        except (OSError, ValueError, TypeError, AttributeError):
-            self.disparos = []
+        except (OSError, ValueError, TypeError, AttributeError, IndexError, KeyError):
+            self.alcances = []
 
     def _guardar(self):
         if self.archivo:
             with open(self.archivo, "w", encoding="utf-8") as f:
-                json.dump({"disparos": self.disparos, "angulo_deg": self.angulo_deg,
+                json.dump({"alcances": self.alcances, "angulo_deg": self.angulo_deg,
                            "altura_cm": self.altura_cm}, f)
 
-    def agregar(self, potencia, alcance_cm):
-        """Registra un disparo de calibración: con esta potencia cayó a este alcance."""
-        if potencia <= 0 or alcance_cm <= 0:
-            raise ValueError("La potencia y el alcance deben ser mayores que 0.")
-        self.disparos.append((float(potencia), float(alcance_cm)))
+    def agregar(self, alcance_cm):
+        """Registra dónde cayó un disparo (cm desde el sensor)."""
+        if alcance_cm <= 0:
+            raise ValueError("El alcance debe ser mayor que 0.")
+        self.alcances.append(float(alcance_cm))
         self._guardar()
-        self._ajustar()
+
+    def borrar(self):
+        self.alcances = []
+        self._guardar()
 
     def configurar_fisica(self, angulo_deg, altura_cm):
-        """Ángulo (0 a 90°) y altura de salida (cm) que usa el método físico."""
+        """Ángulo (0 a 90°) y altura de salida (cm), usados solo para la estimación física."""
         if not 0 <= angulo_deg < 90:
             raise ValueError("El ángulo debe estar entre 0 y 90 grados.")
         if altura_cm < 0:
             raise ValueError("La altura no puede ser negativa.")
         self.angulo_deg, self.altura_cm = float(angulo_deg), float(altura_cm)
         self._guardar()
-        self._ajustar()
 
-    def borrar(self):
-        self.disparos = []
-        self._guardar()
-        self._ajustar()
+    # -- estadística ----------------------------------------------------
+    @property
+    def n(self):
+        return len(self.alcances)
 
-    # -- ajuste ---------------------------------------------------------
-    def _ajustar(self):
-        self._ajustar_empirico()
-        self._ajustar_fisico()
+    @property
+    def alcance_estimado(self):
+        """R0: promedio de los alcances medidos, o None si no hay datos."""
+        return sum(self.alcances) / self.n if self.n else None
 
-    def _ajustar_empirico(self):
-        self.a = self.b = self.error_empirico_cm = None
-        if len({p for p, _ in self.disparos}) < 2:
-            return                      # hacen falta al menos 2 potencias distintas
-        xs = [math.log(p) for p, _ in self.disparos]
-        ys = [math.log(r) for _, r in self.disparos]
-        n = len(xs)
-        mx, my = sum(xs) / n, sum(ys) / n
-        sxx = sum((x - mx) ** 2 for x in xs)
-        b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
-        if b <= 0:
-            return                      # sin sentido: más potencia no llega más lejos
-        a = math.exp(my - b * mx)
-        self.a, self.b = a, b
-        self.error_empirico_cm = sum(abs(r - a * p ** b) for p, r in self.disparos) / n
+    @property
+    def desviacion(self):
+        """Cuánto varía el alcance entre disparos (desviación estándar muestral)."""
+        if self.n < 2:
+            return 0.0
+        m = self.alcance_estimado
+        return math.sqrt(sum((r - m) ** 2 for r in self.alcances) / (self.n - 1))
 
-    def _velocidad_necesaria(self, alcance_cm):
-        """Velocidad de salida (cm/s) para caer a 'alcance_cm' (despeje de la parábola)."""
-        t = math.radians(self.angulo_deg)
+    @property
+    def tolerancia(self):
+        return max(TOLERANCIA_MIN_CM, self.desviacion)
+
+    # -- cuándo disparar -----------------------------------------------
+    def evaluar(self, distancia_cm):
+        """
+        Compara la distancia al objetivo con el alcance del cañón.
+        Devuelve (estado, diferencia_cm, mensaje) con estado en:
+          'sin_datos' | 'lejos' | 'listo' | 'cerca'
+        diferencia = distancia medida - alcance (positiva = hay que acercarse).
+        """
+        r0 = self.alcance_estimado
+        if r0 is None:
+            return "sin_datos", None, "Calibra: dispara y anota dónde cae la pelota."
+        dif = distancia_cm - r0
+        if abs(dif) <= self.tolerancia:
+            return "listo", dif, "¡DISPARA AHORA!"
+        if dif > 0:
+            return "lejos", dif, f"Muy lejos: acércate {dif:.0f} cm"
+        return "cerca", dif, f"Muy cerca: aléjate {-dif:.0f} cm"
+
+    # -- física (tiro parabólico) ----------------------------------------
+    def _velocidad_necesaria(self, alcance_cm, angulo_deg=None):
+        t = math.radians(self.angulo_deg if angulo_deg is None else angulo_deg)
         den = 2 * math.cos(t) ** 2 * (self.altura_cm + alcance_cm * math.tan(t))
         if den <= 0:
             return None
         return math.sqrt(G * alcance_cm ** 2 / den)
 
-    def _alcance_con_velocidad(self, v):
-        """Alcance (cm) de un disparo con velocidad v (cm/s): resuelve h + vy·t - g·t²/2 = 0."""
-        t = math.radians(self.angulo_deg)
+    def _alcance_con_velocidad(self, v, angulo_deg=None):
+        t = math.radians(self.angulo_deg if angulo_deg is None else angulo_deg)
         vy = v * math.sin(t)
         tiempo = (vy + math.sqrt(vy ** 2 + 2 * G * self.altura_cm)) / G
         return v * math.cos(t) * tiempo
 
-    def _ajustar_fisico(self):
-        self.k = self.error_fisico_cm = None
-        pares = []
-        for p, r in self.disparos:
-            v = self._velocidad_necesaria(r)
-            if v is not None:
-                pares.append((p, v))
-        if not pares:
-            return
-        # k por mínimos cuadrados para v = k·P (recta que pasa por el origen)
-        k = sum(p * v for p, v in pares) / sum(p * p for p, _ in pares)
-        if k <= 0:
-            return
-        self.k = k
-        self.error_fisico_cm = sum(abs(r - self._alcance_con_velocidad(k * p))
-                                   for p, r in self.disparos) / len(self.disparos)
+    def velocidad_salida(self):
+        """Velocidad de salida de la pelota (cm/s) que explica el alcance medido, o None."""
+        r0 = self.alcance_estimado
+        return None if r0 is None else self._velocidad_necesaria(r0)
 
-    # -- estado ---------------------------------------------------------
-    def listo(self, metodo="empirico"):
-        return (self.k if metodo == "fisico" else self.a) is not None
+    def alcance_con_angulo(self, angulo_deg):
+        """Alcance (cm) que tendría la pelota con otro ángulo y la misma velocidad de salida."""
+        v = self.velocidad_salida()
+        return None if v is None else self._alcance_con_velocidad(v, angulo_deg)
 
-    def _empirico_incoherente(self):
-        """Hay 2 o más potencias distintas pero el ajuste no tiene sentido físico."""
-        return len({p for p, _ in self.disparos}) >= 2 and not self.listo("empirico")
-
-    # -- uso ------------------------------------------------------------
-    def alcance(self, potencia, metodo="empirico"):
-        """Alcance (cm) que el modelo predice para una potencia."""
-        if metodo == "fisico":
-            return self._alcance_con_velocidad(self.k * potencia)
-        return self.a * potencia ** self.b
-
-    def potencia_para(self, distancia_cm, metodo="empirico"):
-        """
-        Devuelve (potencia entera entre 10 y 100, aviso).
-        Si no se puede calcular, devuelve (None, motivo).
-        """
-        if metodo not in METODOS:
-            raise ValueError(f"Método desconocido: {metodo}")
-        if distancia_cm <= 0:
-            return None, "Distancia no válida."
-
-        if metodo == "empirico":
-            if self._empirico_incoherente():
-                return None, ("Los datos no tienen sentido (más potencia no llega más lejos). "
-                              "Revisa las mediciones o borra la calibración.")
-            if not self.listo(metodo):
-                return None, "Faltan datos: calibra con al menos 2 potencias distintas."
-            p = (distancia_cm / self.a) ** (1 / self.b)
-        else:
-            if not self.disparos:
-                return None, "Faltan datos: guarda al menos 1 disparo de calibración."
-            v = self._velocidad_necesaria(distancia_cm)
-            if not self.listo(metodo) or v is None:
-                return None, "Con ese ángulo y esa altura el modelo no puede explicar los disparos."
-            p = v / self.k
-        return self._acotar(p, distancia_cm, metodo)
-
-    def _acotar(self, p, distancia_cm, metodo):
-        aviso = None
-        if p > POT_MAX:
-            aviso = (f"Fuera de alcance: con {POT_MAX} % llega a "
-                     f"~{self.alcance(POT_MAX, metodo):.0f} cm.")
-            p = POT_MAX
-        elif p < POT_MIN:
-            aviso = (f"Muy cerca: con {POT_MIN} % ya llega a "
-                     f"~{self.alcance(POT_MIN, metodo):.0f} cm.")
-            p = POT_MIN
-        else:
-            minimo = min(r for _, r in self.disparos)
-            maximo = max(r for _, r in self.disparos)
-            if distancia_cm < minimo or distancia_cm > maximo:
-                aviso = (f"Fuera del rango calibrado ({minimo:.0f}-{maximo:.0f} cm): "
-                         "es una estimación.")
-        return int(round(p)), aviso
-
-    def resumen(self, metodo=None):
-        """Texto de estado. Sin argumento, muestra los dos métodos (útil para compararlos)."""
-        if metodo is None:
-            return self.resumen("empirico") + "\n" + self.resumen("fisico")
-        n = len(self.disparos)
-        nombre = NOMBRES[metodo]
-        if n == 0:
-            return f"{nombre}: sin disparos de calibración."
-        if metodo == "empirico":
-            if self._empirico_incoherente():
-                return f"{nombre}: datos incoherentes, revisa las mediciones."
-            if not self.listo(metodo):
-                return f"{nombre}: {n} disparo(s); faltan potencias distintas."
-            return (f"{nombre} ({n} disparos): alcance = {self.a:.3g}·P^{self.b:.2f}, "
-                    f"error medio ±{self.error_empirico_cm:.1f} cm")
-        if not self.listo(metodo):
-            return f"{nombre}: revisa el ángulo y la altura."
-        return (f"{nombre} ({n} disparos): v = {self.k:.2f}·P cm/s "
-                f"(θ={self.angulo_deg:g}°, h={self.altura_cm:g} cm), "
-                f"error medio ±{self.error_fisico_cm:.1f} cm")
-
-
-# ----------------------------------------------------------------------
-# Prueba rápida:  python balistica.py   (robot simulado, no toca tus datos)
-# ----------------------------------------------------------------------
+    # -- texto ----------------------------------------------------------
+    def resumen(self):
+        r0 = self.alcance_estimado
+        if r0 is None:
+            return (f"Sin disparos guardados. Dispara (potencia fija {POTENCIA_DISPARO} %) "
+                    "y anota dónde cae.")
+        texto = f"Alcance estimado: {r0:.0f} cm (zona de acierto ±{self.tolerancia:.0f} cm), {self.n} disparo(s)"
+        if self.n < 3:
+            texto += "\nGuarda al menos 3 a 5 disparos para que sea confiable."
+        v = self.velocidad_salida()
+        if v is not None:
+            texto += (f"\nVelocidad de salida estimada: {v / 100:.1f} m/s "
+                      f"(θ={self.angulo_deg:g}°, h={self.altura_cm:g} cm)")
+        return texto
+            
 if __name__ == "__main__":
     import random
 
-    random.seed(1)
+    random.seed(3)
     modelo = ModeloDisparo(archivo=None)
     modelo.configurar_fisica(angulo_deg=45, altura_cm=20)
 
-    K_REAL = 4.6          # cm/s por cada 1 % de potencia
-    ARRASTRE = 0.92       # el aire frena la pelota: alcanza ~8 % menos que en el vacío
-    for potencia in (30, 50, 70, 90):
-        for _ in range(3):
-            ideal = modelo._alcance_con_velocidad(K_REAL * potencia)
-            modelo.agregar(potencia, ideal * ARRASTRE * random.uniform(0.95, 1.05))
+    V_REAL = 420.0     # cm/s: velocidad "real" de salida del robot simulado
+    for _ in range(6):
+        ideal = modelo._alcance_con_velocidad(V_REAL)
+        modelo.agregar(ideal * 0.92 * random.uniform(0.96, 1.04))   # el aire acorta ~8 %
 
     print(modelo.resumen())
     print()
-    for objetivo in (40, 80, 120, 160, 400):
-        emp, aviso_e = modelo.potencia_para(objetivo, "empirico")
-        fis, aviso_f = modelo.potencia_para(objetivo, "fisico")
-        extra = f" | {aviso_f}" if aviso_f else ""
-        print(f"Objetivo a {objetivo:>3} cm -> empírico {emp} %, físico {fis} %{extra}")
+    r0 = modelo.alcance_estimado
+    for distancia in (r0 + 60, r0 + 12, r0 + 2, r0 - 3, r0 - 25):
+        estado, _, mensaje = modelo.evaluar(distancia)
+        print(f"Sensor mide {distancia:>5.0f} cm -> {estado:<5} | {mensaje}")
+    print("\nSi más adelante el cañón cambia de ángulo (misma velocidad de salida):")
+    for angulo in (30, 40, 45, 55, 65):
+        print(f"  θ = {angulo}° -> alcance ~{modelo.alcance_con_angulo(angulo):.0f} cm")
