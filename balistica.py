@@ -1,7 +1,7 @@
-
+"""
 MODELO
-  La pelota sale de la boca del cañón con velocidad v y ángulo θ, desde una altura y0
-  y una posición horizontal x0 (medida desde el SENSOR de distancia):
+#  La pelota sale de la boca del cañón con velocidad v y ángulo θ, desde una altura y0
+#  y una posición horizontal x0 (medida desde el SENSOR de distancia):
 
       x0 = PIVOTE_ADELANTE + LARGO·cosθ            y0 = ALTURA_PIVOTE + LARGO·sinθ
 
@@ -21,7 +21,7 @@ USO
 CONVENCIÓN DE MEDIDA (importante): el alcance se mide desde el SENSOR hasta el
 punto donde la pelota toca el piso por PRIMERA vez, en la dirección del disparo.
 
-
+"""
 import json
 import math
 import os
